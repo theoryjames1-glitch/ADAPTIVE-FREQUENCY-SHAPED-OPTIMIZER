@@ -276,3 +276,246 @@ If you want, I can:
 * add a **2-section (SOS) cascade** variant,
 * include **per-layer statistics** and a tiny **frequency estimator** utility,
 * or wrap this as a drop-in **PyTorch Optimizer** class with state dict save/load.
+
+### PSEUDOCODE
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Reproducibility
+torch.manual_seed(0)
+np.random.seed(0)
+
+# Training data: y = sin(x) + noise
+n_train = 512
+X = torch.linspace(-2*np.pi, 2*np.pi, n_train).unsqueeze(1)
+y = torch.sin(X) + 0.05*torch.randn_like(X)
+
+train_dataset = torch.utils.data.TensorDataset(X, y)
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=64, shuffle=True)
+
+
+class MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(1, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, 1)
+
+    def forward(self, x):
+        x = torch.tanh(self.fc1(x))
+        x = torch.tanh(self.fc2(x))
+        return self.fc3(x)
+
+import torch
+from torch import nn
+from torch.nn.utils import clip_grad_norm_
+
+class Biquad:
+    # y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]
+    def __init__(self, device, shape):
+        self.device = device
+        self.x1 = torch.zeros(shape, device=device)
+        self.x2 = torch.zeros(shape, device=device)
+        self.y1 = torch.zeros(shape, device=device)
+        self.y2 = torch.zeros(shape, device=device)
+        # coefficients (buffers)
+        self.b = torch.tensor([1., 0., 0.], device=device)  # will set later
+        self.a = torch.tensor([1., 0., 0.], device=device)  # [1, a1, a2]
+
+    def set_coeffs(self, b, a):
+        self.b = b.clone()
+        self.a = a.clone()
+
+    def step(self, x):
+        y = (self.b[0]*x + self.b[1]*self.x1 + self.b[2]*self.x2
+             - self.a[1]*self.y1 - self.a[2]*self.y2)
+        self.x2, self.x1 = self.x1, x
+        self.y2, self.y1 = self.y1, y
+        return y
+
+def stable_biquad_from_r_theta(r, theta, dc_unity=True, device='cpu'):
+    # Poles at r*e^{±jθ} → a1 = -2 r cos θ, a2 = r^2
+    a1 = -2.0 * r * torch.cos(theta)
+    a2 = r**2
+    # Numerator single tap b0 adjusted to make H(1)=1
+    b0 = 1.0 + a1 + a2 if dc_unity else 1.0
+    b = torch.tensor([b0, 0.0, 0.0], device=device)
+    a = torch.tensor([1.0, a1.item(), a2.item()], device=device)
+    return b, a
+
+class AFSO:
+    """
+    Adaptive Frequency-Shaped Optimizer:
+    - Per-parameter SOS (use 1 section here; stack if desired)
+    - RMSProp-like scaling
+    - Meta-controllers that adapt lr, r, theta every K steps
+    """
+    def __init__(self, params, lr=1e-3, beta2=0.999, eps=1e-8,
+                 r_max=0.995, device='cpu', K=20):
+        self.params = list(params)
+        self.beta2 = beta2
+        self.eps = eps
+        self.device = device
+        self.K = K
+
+        # Hyperparams in unconstrained form
+        self.log_lr = torch.tensor([torch.log(torch.tensor(lr))], device=device)
+        self.s_r   = torch.tensor([0.0], device=device)         # r = sigmoid(s_r)*r_max
+        self.u_th  = torch.tensor([0.5], device=device)         # theta = pi*sigmoid(u_th)
+
+        # State: per-parameter accumulators
+        self.v = [torch.zeros_like(p.data, device=device) for p in self.params]
+        self.filters = [Biquad(device, p.data.shape) for p in self.params]
+
+        # Meters
+        self.prev_loss = None
+        self.P_bar = torch.tensor([0.0], device=device)  # progress EMA
+        self.P_target = torch.tensor([1e-3], device=device)
+        self.O_bar = torch.tensor([0.0], device=device)  # oscillation score EMA
+        self.N_bar = torch.tensor([0.0], device=device)  # noise ratio EMA
+        self.m_decay = 0.9
+
+        # Controller gains
+        self.kp = 0.2; self.ki = 0.01; self.kd = 0.1
+        self.e_int = torch.tensor([0.0], device=device)
+        self.e_prev = torch.tensor([0.0], device=device)
+        self.alpha_r = 0.02; self.alpha_th = 0.05
+
+        # Init filter coeffs
+        self.r_max = r_max
+
+    def stats(self):
+        # decode unconstrained params into actual values
+        r = torch.sigmoid(self.s_r).item() * self.r_max
+        theta = torch.pi * torch.sigmoid(self.u_th).item()
+        lr = self.log_lr.exp().item()
+        return {
+            "lr": lr,
+            "r": r,
+            "theta": theta,
+            "P_bar": self.P_bar.item(),
+            "O_bar": self.O_bar.item(),
+            "N_bar": self.N_bar.item()
+        }
+
+    def _apply_filter_coeffs(self):
+        r = torch.sigmoid(self.s_r) * self.r_max
+        theta = torch.pi * torch.sigmoid(self.u_th)
+        for f in self.filters:
+            b, a = stable_biquad_from_r_theta(r, theta, dc_unity=True, device=self.device)
+            f.set_coeffs(b, a)
+
+    @torch.no_grad()
+    def step(self, loss):
+        # 1) Collect grads
+        grads = [p.grad if p.grad is not None else torch.zeros_like(p) for p in self.params]
+        self._apply_filter_coeffs()
+
+        # 2) Filter gradients + RMSProp scale
+        g_tilde = []
+        for p, g, v, flt in zip(self.params, grads, self.v, self.filters):
+            y = flt.step(g)
+            v.mul_(self.beta2).addcmul_(y, y, value=(1 - self.beta2))
+            g_tilde.append(y / (v.sqrt() + self.eps))
+
+        # 3) Update params with current lr
+        lr = self.log_lr.exp().item()
+        delta_norm_sq = 0.0
+        for p, gt in zip(self.params, g_tilde):
+            update = -lr * gt
+            p.add_(update)
+            delta_norm_sq += update.pow(2).sum().item()
+
+        # 4) Update meters
+        with torch.no_grad():
+            L = loss.item()
+            if self.prev_loss is not None:
+                dL = (self.prev_loss - L)
+                step_norm = (delta_norm_sq ** 0.5) + 1e-12
+                P = dL / step_norm
+                self.P_bar = self.m_decay * self.P_bar + (1 - self.m_decay) * torch.tensor([P], device=self.device)
+
+                # Simple oscillation score: sign flip & variance growth
+                O = 1.0 if dL < 0 else 0.0  # penalize regressions
+                self.O_bar = self.m_decay * self.O_bar + (1 - self.m_decay) * torch.tensor([O], device=self.device)
+
+                # Rough noise ratio proxy: gradient roughness pre/post filter
+                # (Use one tensor for estimate)
+                if len(grads):
+                    g0 = grads[0].detach().view(-1)
+                    y0 = g_tilde[0].detach().view(-1)
+                    var_raw = g0.var() + 1e-12
+                    var_flt = y0.var() + 1e-12
+                    N = (var_raw / var_flt).clamp(max=1e6).log()  # log SNR improvement
+                    self.N_bar = self.m_decay * self.N_bar + (1 - self.m_decay) * N.unsqueeze(0)
+
+            self.prev_loss = L
+
+        # 5) Every K steps, adapt hyperparams
+        if not hasattr(self, "_k"): self._k = 0
+        self._k += 1
+        if self._k % self.K == 0 and self.prev_loss is not None:
+            # (a) LR PID on progress
+            e = (self.P_target - self.P_bar)
+            self.e_int += e
+            e_der = (e - self.e_prev)
+            self.e_prev = e
+            self.log_lr += self.kp*e + self.ki*self.e_int + self.kd*e_der
+            self.log_lr.clamp_(min=torch.log(torch.tensor(1e-6)), max=torch.log(torch.tensor(1.0)))
+
+            # (b) Radius controller: up with noise cleaning, down with oscillation
+            delta_s = self.alpha_r * torch.clamp( 0.5*self.N_bar - 0.8*self.O_bar, min=-0.1, max=0.1 )
+            self.s_r += delta_s
+
+            # (c) Angle controller: tiny nudge toward pi if oscillation persists
+            # (proxy: if O high, push toward a higher-frequency damping)
+            self.u_th += self.alpha_th * torch.clamp(self.O_bar - 0.1, min=-0.05, max=0.05)
+
+            # Keep things sane
+            self.s_r.clamp_(min=-6.0, max=6.0)
+            self.u_th.clamp_(min=-4.0, max=4.0)
+
+    def zero_grad(self):
+        for p in self.params:
+            if p.grad is not None:
+                p.grad.detach_()
+                p.grad.zero_()
+
+def train_model(model, optimizer, epochs=5, use_afso=False):
+    losses = []    
+    for epoch in range(epochs):
+        for xb, yb in train_loader:
+            pred = model(xb)
+            loss = F.mse_loss(pred, yb)
+            loss.backward()
+
+            if use_afso:
+                optimizer.step(loss)  # custom step with loss feedback
+            else:
+                optimizer.step()
+
+            optimizer.zero_grad()
+            losses.append(loss.item())
+
+
+        # Print stats every N steps
+        if(type(optimizer) is AFSO):
+            print(f"Loss={loss.item():.4e} | Stats={optimizer.stats()}")
+
+    return losses
+
+# Model + Adam
+model_adam = MLP()
+opt_adam = torch.optim.Adam(model_adam.parameters(), lr=1e-3)
+losses_adam = train_model(model_adam, opt_adam, use_afso=False)
+
+# Model + AFSO
+model_afso = MLP()
+opt_afso = AFSO(model_afso.parameters(), lr=1e-3, device='cpu', K=20)
+losses_afso = train_model(model_afso, opt_afso, use_afso=True)
+```
