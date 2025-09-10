@@ -1,4 +1,3 @@
-Love the ambition. Here’s a concrete design for an optimizer that **learns to converge faster as it trains**, not just by scaling steps (Adam-style) but by **adapting its own frequency response** and step size online.
 
 # AFSO: Adaptive Frequency-Shaped Optimizer
 
